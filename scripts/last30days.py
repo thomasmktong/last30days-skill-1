@@ -150,6 +150,7 @@ from lib import (
     openai_reddit,
     reddit,
     reddit_enrich,
+    reddit_readonly,
     render,
     schema,
     score,
@@ -184,8 +185,10 @@ def _search_reddit(
 ) -> tuple:
     """Search Reddit (runs in thread).
 
-    Uses ScrapeCreators when SCRAPECREATORS_API_KEY is available (preferred).
-    Falls back to OpenAI Responses API otherwise.
+    Priority:
+    1. ScrapeCreators API (when SCRAPECREATORS_API_KEY available)
+    2. reddit-readonly.mjs (free, reliable fallback)
+    3. OpenAI Responses API (only if user has key and wants it)
 
     Returns:
         Tuple of (reddit_items, raw_response, error, used_scrapecreators)
@@ -193,14 +196,17 @@ def _search_reddit(
     raw_response = None
     reddit_error = None
     used_scrapecreators = False
+    reddit_items = []
 
     sc_token = config.get("SCRAPECREATORS_API_KEY")
 
     if mock:
         raw_response = load_fixture("openai_sample.json")
-    elif sc_token:
-        # === ScrapeCreators path (preferred) ===
-        used_scrapecreators = True
+        reddit_items = openai_reddit.parse_reddit_response(raw_response)
+        return reddit_items, raw_response, None, False
+
+    # === Path 1: ScrapeCreators API (preferred) ===
+    if sc_token:
         try:
             sys.stderr.write("[Reddit] Using ScrapeCreators API\n")
             sys.stderr.flush()
@@ -209,107 +215,62 @@ def _search_reddit(
                 depth=depth, token=sc_token,
             )
             reddit_items = result.get("items", [])
+            raw_response = result
             if result.get("error"):
                 reddit_error = result["error"]
-            return reddit_items, result, reddit_error, used_scrapecreators
+            used_scrapecreators = True
+            # If ScrapeCreators worked, return early
+            if reddit_items:
+                return reddit_items, raw_response, reddit_error, used_scrapecreators
+            # If no results, fall through to reddit-readonly
+            sys.stderr.write("[Reddit] ScrapeCreators returned no results, trying reddit-readonly\n")
+            sys.stderr.flush()
         except Exception as e:
             reddit_error = f"ScrapeCreators: {type(e).__name__}: {e}"
             sys.stderr.write(f"[Reddit] ScrapeCreators failed: {e}\n")
             sys.stderr.flush()
-            # Fall through to OpenAI if we have that key
-            if not config.get("OPENAI_API_KEY"):
-                # No OpenAI either: try public Reddit fallback.
-                try:
-                    reddit_items = openai_reddit.search_reddit_public(
-                        topic, from_date, to_date, depth=depth,
-                    )
-                    raw_response = {"source": "reddit_public", "items": reddit_items}
-                    return reddit_items, raw_response, None, False
-                except Exception as e2:
-                    return [], {"error": str(e)}, reddit_error, used_scrapecreators
-            used_scrapecreators = False
-            sys.stderr.write("[Reddit] Falling back to OpenAI\n")
-            sys.stderr.flush()
+            # Fall through to reddit-readonly
 
-    # === OpenAI path (fallback) ===
-    if not mock:
-        if config.get("OPENAI_API_KEY"):
-            try:
-                raw_response = openai_reddit.search_reddit(
-                    config["OPENAI_API_KEY"],
-                    selected_models["openai"],
-                    topic,
-                    from_date,
-                    to_date,
-                    depth=depth,
-                    auth_source=config.get("OPENAI_AUTH_SOURCE", "api_key"),
-                    account_id=config.get("OPENAI_CHATGPT_ACCOUNT_ID"),
-                )
-            except http.HTTPError as e:
-                raw_response = {"error": str(e)}
-                reddit_error = f"API error: {e}"
-            except Exception as e:
-                raw_response = {"error": str(e)}
-                reddit_error = f"{type(e).__name__}: {e}"
-        else:
-            # No OpenAI auth: direct Reddit public JSON fallback.
-            try:
-                reddit_items = openai_reddit.search_reddit_public(
-                    topic, from_date, to_date, depth=depth,
-                )
-                raw_response = {"source": "reddit_public", "items": reddit_items}
-            except http.HTTPError as e:
-                reddit_items = []
-                raw_response = {"error": str(e), "source": "reddit_public"}
-                reddit_error = f"Reddit public API error: {e}"
-            except Exception as e:
-                reddit_items = []
-                raw_response = {"error": str(e), "source": "reddit_public"}
-                reddit_error = f"Reddit public search error: {type(e).__name__}: {e}"
+    # === Path 2: reddit-readonly.mjs (free fallback) ===
+    try:
+        sys.stderr.write("[Reddit] Using reddit-readonly.mjs (free fallback)\n")
+        sys.stderr.flush()
+        result = reddit_readonly.search_and_enrich(
+            topic, depth=depth, mock=mock,
+        )
+        reddit_items = result.get("items", [])
+        raw_response = result
+        if result.get("error"):
+            reddit_error = result["error"]
+        # If reddit-readonly worked, return early
+        if reddit_items:
+            return reddit_items, raw_response, reddit_error, False
+    except Exception as e:
+        sys.stderr.write(f"[Reddit] reddit-readonly failed: {e}\n")
+        sys.stderr.flush()
+        reddit_error = f"reddit-readonly: {type(e).__name__}: {e}"
 
-    # Parse response
-    reddit_items = openai_reddit.parse_reddit_response(raw_response or {})
-
-    # Quick retry with simpler query if few results
-    if len(reddit_items) < 5 and not mock and not reddit_error and config.get("OPENAI_API_KEY"):
-        core = openai_reddit._extract_core_subject(topic)
-        if core.lower() != topic.lower():
-            try:
-                retry_raw = openai_reddit.search_reddit(
-                    config["OPENAI_API_KEY"],
-                    selected_models["openai"],
-                    core,
-                    from_date, to_date,
-                    depth=depth,
-                    auth_source=config.get("OPENAI_AUTH_SOURCE", "api_key"),
-                    account_id=config.get("OPENAI_CHATGPT_ACCOUNT_ID"),
-                )
-                retry_items = openai_reddit.parse_reddit_response(retry_raw)
-                existing_urls = {item.get("url") for item in reddit_items}
-                for item in retry_items:
-                    if item.get("url") not in existing_urls:
-                        reddit_items.append(item)
-            except Exception:
-                pass
-
-    # Subreddit-targeted fallback if still < 3 results
-    if len(reddit_items) < 3 and not mock and not reddit_error and config.get("OPENAI_API_KEY"):
-        sub_query = openai_reddit._build_subreddit_query(topic)
+    # === Path 3: OpenAI Responses API (only if user has key) ===
+    if config.get("OPENAI_API_KEY") and not reddit_items:
         try:
-            sub_raw = openai_reddit.search_reddit(
+            sys.stderr.write("[Reddit] Using OpenAI Responses API (last resort)\n")
+            sys.stderr.flush()
+            raw_response = openai_reddit.search_reddit(
                 config["OPENAI_API_KEY"],
                 selected_models["openai"],
-                sub_query,
-                from_date, to_date,
+                topic,
+                from_date,
+                to_date,
                 depth=depth,
+                auth_source=config.get("OPENAI_AUTH_SOURCE", "api_key"),
+                account_id=config.get("OPENAI_CHATGPT_ACCOUNT_ID"),
             )
-            sub_items = openai_reddit.parse_reddit_response(sub_raw)
-            existing_urls = {item.get("url") for item in reddit_items}
-            for item in sub_items:
-                if item.get("url") not in existing_urls:
-                    reddit_items.append(item)
-        except Exception:
-            pass
+            reddit_items = openai_reddit.parse_reddit_response(raw_response)
+        except Exception as e:
+            sys.stderr.write(f"[Reddit] OpenAI failed: {e}\n")
+            sys.stderr.flush()
+            reddit_error = f"OpenAI: {type(e).__name__}: {e}"
+            raw_response = {"error": str(e)}
 
     return reddit_items, raw_response, reddit_error, used_scrapecreators
 
